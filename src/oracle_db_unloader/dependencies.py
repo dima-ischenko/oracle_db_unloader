@@ -82,13 +82,13 @@ def fetch_dependency_edges(engine: Engine) -> List[Tuple[Node, Node]]:
 def dependency_rows(graph: DependencyGraph, root: Node) -> List[DepRow]:
     rows = _walk_upstream(graph, root)
     rows.extend(_walk_downstream(graph, root))
-    rows.sort(key=lambda row: (row.ref_type != 'upstream', row.xref_path))
+    rows.sort(key=lambda row: (row.ref_type != 'downstream', row.xref_path))
     return rows
 
 
 def format_dep_markdown(rows: Sequence[DepRow]) -> str:
     sections: List[str] = []
-    for title, ref_type in (('Upstream', 'upstream'), ('Downstream', 'downstream')):
+    for title, ref_type in (('Downstream', 'downstream'), ('Upstream', 'upstream')):
         paths = [row.xref_path for row in rows if row.ref_type == ref_type]
         if not paths:
             continue

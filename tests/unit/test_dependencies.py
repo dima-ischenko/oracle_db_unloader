@@ -138,13 +138,13 @@ def test_write_schema_dependencies_layout_and_stale_delete(tmp_path):
     path = tmp_path / 'scott' / '_deps' / 'views' / 'emp_v.md'
     text = path.read_text(encoding='utf-8')
     assert text == (
-        '## Upstream\n'
-        '\n'
-        'scott.pkg_x(package body) >\n'
-        '\n'
         '## Downstream\n'
         '\n'
         '> scott.emp(table)\n'
+        '\n'
+        '## Upstream\n'
+        '\n'
+        'scott.pkg_x(package body) >\n'
     )
     assert 'scott.emp_v(view)' not in text
     assert not stale.exists()

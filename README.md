@@ -60,8 +60,8 @@ runs only for that schema (and overrides a shared `_meta` script of the same
 name). Results are written as `<schema>/_meta/<script>.md`.
 
 `--dependencies` writes per-object leaf paths under `<schema>/_deps/<type>/`
-with `## Upstream` (consumers, path ends with `>`) and `## Downstream`
-(sources, path starts with `>`). The object's own name is omitted from
+with `## Downstream` (sources, path starts with `>`) and `## Upstream`
+(consumers, path ends with `>`). The object's own name is omitted from
 each path. That pass always refreshes the selected types: a new consumer
 in another schema does not change the object's `last_ddl_time`. DDL
 watermarks are not used. Off by default.
@@ -120,7 +120,7 @@ partition by ...` statement (template only, no per-partition lists). Custom
 under every schema; `<schema>/_meta/*.sql` writes only to that schema.
 
 `--dependencies` writes `<schema>/_deps/<type>/<object>.md` with
-`## Upstream` / `## Downstream` sections of leaf paths. Objects with no
+`## Downstream` / `## Upstream` sections of leaf paths. Objects with no
 edges produce no file; stale `_deps` files for the selected types are
 removed.
 
