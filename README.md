@@ -22,7 +22,6 @@ db-unloader --db-url oracle+oracledb://system:pass@localhost:1521/?service_name=
   --object-types table,view,package \
   --output-dir ./ddl \
   --max-workers 5 \
-  --custom-sql-dir ./dictionary_sql \
   --dependencies
 ```
 
@@ -53,11 +52,11 @@ names stay lowercase (`mixedcase_metrics.sql`). Simple uppercase identifiers
 are unquoted and lowercased; mixed-case and other names that need quoting
 stay quoted. SQL statements end with `;`; PL/SQL source still uses `/`.
 
-Custom SELECTs live in underscore-prefixed folders at the output root (or in
-`--custom-sql-dir`), for example `_meta/get_table_stats.sql`. Bind `:schema`
-to run the same query for every schema. A script in `<schema>/_meta/*.sql`
-runs only for that schema (and overrides a shared `_meta` script of the same
-name). Results are written as `<schema>/_meta/<script>.md`.
+Custom SELECTs live in the `_meta/` folder at the output root, for example
+`_meta/get_table_stats.sql`. Bind `:schema` to run the same query for every
+schema. A script in `<schema>/_meta/*.sql` runs only for that schema (and
+overrides a shared `_meta` script of the same name). Results are written as
+`<schema>/_meta/<script>.md`.
 
 `--dependencies` writes per-object leaf paths under `<schema>/_deps/<type>/`
 with `## Downstream` (sources, path starts with `>`) and `## Upstream`
@@ -88,7 +87,7 @@ try:
     )
     client.ddl()
     client.dependencies()
-    client.custom_sql(custom_sql_dir='/data/dictionary_sql')
+    client.custom_sql()
 finally:
     engine.dispose()
 ```
@@ -116,7 +115,7 @@ The tree is reused across runs (no timestamp folder) so git and incremental
 unloads work. Incremental watermarks live in each schema folder as
 `.unloader_state.json`. Table and materialized-view files get an `alter table ... modify`
 partition by ...` statement (template only, no per-partition lists). Custom
-`_*/` SELECT scripts are always re-run with `:schema`. Shared scripts write
+`_meta/` SELECT scripts are always re-run with `:schema`. Shared scripts write
 under every schema; `<schema>/_meta/*.sql` writes only to that schema.
 
 `--dependencies` writes `<schema>/_deps/<type>/<object>.md` with

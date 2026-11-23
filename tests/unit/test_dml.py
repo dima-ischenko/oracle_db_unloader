@@ -27,9 +27,9 @@ def test_stringify_cell_formats_types():
     assert stringify_cell(datetime(2026, 11, 16, 8, 0, 0)) == '16-nov-2026 08:00:00'
 
 
-def test_discover_custom_sql_underscore_dirs(tmp_path):
+def test_discover_custom_sql_meta_only(tmp_path):
     meta = tmp_path / '_meta'
-    other = tmp_path / 'tables'
+    other = tmp_path / '_stats'
     meta.mkdir()
     other.mkdir()
     (meta / 'get_table_stats.sql').write_text(
@@ -37,49 +37,28 @@ def test_discover_custom_sql_underscore_dirs(tmp_path):
         encoding='utf-8',
     )
     (other / 'ignored.sql').write_text('select 1 from dual', encoding='utf-8')
-    found = discover_custom_sql(tmp_path)
-    assert found == [(meta / 'get_table_stats.sql', '_meta/get_table_stats')]
+    assert discover_custom_sql(tmp_path) == [meta / 'get_table_stats.sql']
 
 
 def test_dump_custom_sql_writes_per_schema(tmp_path):
-    sql_dir = tmp_path / 'sql'
-    meta = sql_dir / '_meta'
-    meta.mkdir(parents=True)
+    meta = tmp_path / '_meta'
+    meta.mkdir()
     (meta / 'get_table_stats.sql').write_text(
         'select owner from dba_tables where owner = :schema',
         encoding='utf-8',
     )
-    output = tmp_path / 'out'
     conn = _FakeConnection(
         columns=['OWNER'],
         rows_by_schema={'SCOTT': [['SCOTT']], 'HR': [['HR']]},
     )
-    dumped = dump_custom_sql(
-        _FakeEngine(conn),
-        output,
-        ['scott', 'hr'],
-        custom_sql_dir=sql_dir,
-    )
+    dumped = dump_custom_sql(_FakeEngine(conn), tmp_path, ['scott', 'hr'])
     assert dumped == 2
-    assert 'SCOTT' in (output / 'scott' / '_meta' / 'get_table_stats.md').read_text(
+    assert 'SCOTT' in (tmp_path / 'scott' / '_meta' / 'get_table_stats.md').read_text(
         encoding='utf-8'
     )
-    assert 'HR' in (output / 'hr' / '_meta' / 'get_table_stats.md').read_text(
+    assert 'HR' in (tmp_path / 'hr' / '_meta' / 'get_table_stats.md').read_text(
         encoding='utf-8'
     )
-
-
-def test_dump_custom_sql_reads_underscore_dir_from_output_root(tmp_path):
-    meta = tmp_path / '_meta'
-    meta.mkdir()
-    (meta / 'get_table_stats.sql').write_text(
-        'select :schema as owner from dual',
-        encoding='utf-8',
-    )
-    conn = _FakeConnection(columns=['OWNER'], rows_by_schema={'SCOTT': [['SCOTT']]})
-    dumped = dump_custom_sql(_FakeEngine(conn), tmp_path, ['SCOTT'])
-    assert dumped == 1
-    assert (tmp_path / 'scott' / '_meta' / 'get_table_stats.md').is_file()
 
 
 def test_dump_schema_specific_meta_sql_only_that_schema(tmp_path):

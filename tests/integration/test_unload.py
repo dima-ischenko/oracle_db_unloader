@@ -17,7 +17,6 @@ from oracle_db_unloader.state import get_last_unload_at, load_state
 def _unload(
     engine,
     tmp_path,
-    custom_sql_dir=None,
     full=False,
     lookback_minutes=0,
     object_types=None,
@@ -33,7 +32,7 @@ def _unload(
     client.ddl(full=full, lookback_minutes=lookback_minutes)
     if dependencies:
         client.dependencies()
-    client.custom_sql(custom_sql_dir=custom_sql_dir)
+    client.custom_sql()
 
 
 def test_unload_writes_expected_files_and_headers(fresh_schema, tmp_path):

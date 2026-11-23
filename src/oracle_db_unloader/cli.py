@@ -41,18 +41,6 @@ def build_parser() -> argparse.ArgumentParser:
         help='Parallel DDL/_deps/_meta workers / SQLAlchemy pool size (default: 5)',
     )
     parser.add_argument(
-        '--custom-sql-dir',
-        dest='custom_sql_dir',
-        default=None,
-        help=(
-            'Directory of underscore-prefixed folders with SELECT scripts '
-            '(e.g. _meta/get_table_stats.sql). If omitted, scripts are read '
-            'from output-dir. Bind :schema to run the same query for every '
-            'schema. A script in <schema>/_meta/*.sql runs only for that '
-            'schema. Results go to <schema>/_meta/<script>.md'
-        ),
-    )
-    parser.add_argument(
         '--full',
         action='store_true',
         help='Ignore watermarks and rewrite every object',
@@ -156,7 +144,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         client.ddl(full=args.full, lookback_minutes=args.lookback_minutes)
         if args.dependencies:
             client.dependencies()
-        client.custom_sql(custom_sql_dir=args.custom_sql_dir)
+        client.custom_sql()
     except UnloadError as exc:
         logger.error('%s', exc)
         return 1

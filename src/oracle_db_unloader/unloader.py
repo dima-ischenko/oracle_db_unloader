@@ -380,16 +380,14 @@ class Unloader:
         except Exception as exc:
             self._fail(RunStats(), started, exc, label='dependencies')
 
-    def custom_sql(self, custom_sql_dir: Union[str, Path, None] = None) -> int:
-        """Run user ``_*/`` SELECT scripts into ``schema/_meta/*.md``."""
+    def custom_sql(self) -> int:
+        """Run ``_meta/`` SELECT scripts into ``schema/_meta/*.md``."""
         started = time.perf_counter()
-        sql_dir = Path(custom_sql_dir) if custom_sql_dir is not None else None
         try:
             return dump_custom_sql(
                 self.engine,
                 self.output_dir,
                 self.schemas,
-                custom_sql_dir=sql_dir,
                 max_workers=self.max_workers,
             )
         except Exception as exc:

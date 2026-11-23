@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -17,6 +17,7 @@ from .resources import bind_params
 logger = get_logger(__name__)
 
 NULL_TOKEN = 'null'
+CUSTOM_SQL_FOLDER = '_meta'
 _MONTHS = (
     'jan',
     'feb',
@@ -74,49 +75,20 @@ def format_table(
     )
 
 
-def discover_custom_sql(root: Path) -> List[Tuple[Path, str]]:
-    """Find ``_dir/*.sql`` scripts. Returns ``(path, relative stem)`` pairs.
-
-    Relative stem is ``_meta/get_table_stats`` for ``_meta/get_table_stats.sql``.
-    """
-    sql_dir = Path(root)
-    found: List[Tuple[Path, str]] = []
-    if not sql_dir.is_dir():
-        return found
-    for directory in sorted(
-        child
-        for child in sql_dir.iterdir()
-        if child.is_dir() and child.name.startswith('_')
-    ):
-        for path in sorted(directory.glob('*.sql')):
-            found.append((path, f'{directory.name}/{path.stem}'))
-    return found
-
-
-def discover_schema_meta_sql(schema_root: Path) -> List[Path]:
-    """Find schema-specific scripts in ``<schema>/_meta/*.sql``."""
-    meta = Path(schema_root) / '_meta'
+def discover_custom_sql(root: Path) -> List[Path]:
+    """Find ``_meta/*.sql`` scripts under ``root``."""
+    meta = Path(root) / CUSTOM_SQL_FOLDER
     if not meta.is_dir():
         return []
     return sorted(path for path in meta.glob('*.sql') if path.is_file())
 
 
-def custom_sql_roots(
-    output_dir: Path,
-    custom_sql_dir: Optional[Path] = None,
-) -> List[Path]:
-    roots: List[Path] = []
-    seen = set()
-    for raw in (custom_sql_dir, output_dir):
-        if raw is None:
-            continue
-        path = Path(raw)
-        key = path.resolve() if path.exists() else path
-        if key in seen:
-            continue
-        seen.add(key)
-        roots.append(path)
-    return roots
+def discover_schema_meta_sql(schema_root: Path) -> List[Path]:
+    """Find schema-specific scripts in ``<schema>/_meta/*.sql``."""
+    meta = Path(schema_root) / CUSTOM_SQL_FOLDER
+    if not meta.is_dir():
+        return []
+    return sorted(path for path in meta.glob('*.sql') if path.is_file())
 
 
 def _warn_top_level_sql(root: Path) -> None:
@@ -133,18 +105,10 @@ def _warn_top_level_sql(root: Path) -> None:
     )
 
 
-def _schema_meta_scripts(
-    roots: Sequence[Path],
-    schema: str,
-) -> Dict[str, Path]:
-    by_stem: Dict[str, Path] = {}
-    for root in roots:
-        if not root.is_dir():
-            continue
-        for path in discover_schema_meta_sql(root / schema.lower()):
-            if path.stem not in by_stem:
-                by_stem[path.stem] = path
-    return by_stem
+def _schema_meta_scripts(root: Path, schema: str) -> Dict[str, Path]:
+    if not root.is_dir():
+        return {}
+    return {path.stem: path for path in discover_schema_meta_sql(root / schema.lower())}
 
 
 @dataclass(frozen=True)
@@ -225,47 +189,34 @@ def dump_custom_sql(
     engine: Engine,
     output_dir: Path,
     schemas: Sequence[str],
-    custom_sql_dir: Optional[Path] = None,
     *,
     max_workers: int = 5,
 ) -> int:
     target_root = Path(output_dir)
-    roots = custom_sql_roots(target_root, custom_sql_dir)
-    scripts: List[Tuple[Path, str]] = []
-    seen_rel: Dict[str, Path] = {}
-    for root in roots:
-        if not root.is_dir():
-            if custom_sql_dir is not None and root == Path(custom_sql_dir):
-                raise FileNotFoundError(f'custom SQL directory not found: {root}')
-            continue
-        _warn_top_level_sql(root)
-        for path, rel in discover_custom_sql(root):
-            if rel in seen_rel:
-                continue
-            seen_rel[rel] = path
-            scripts.append((path, rel))
-
+    _warn_top_level_sql(target_root)
+    shared = discover_custom_sql(target_root)
     schema_list = [schema.strip().upper() for schema in schemas if schema.strip()]
     per_schema = {
-        schema: _schema_meta_scripts(roots, schema) for schema in schema_list
+        schema: _schema_meta_scripts(target_root, schema) for schema in schema_list
     }
     schema_script_count = sum(len(items) for items in per_schema.values())
-    if not scripts and schema_script_count == 0:
-        if custom_sql_dir is not None:
-            logger.info('custom sql: 0 script(s) from %s', custom_sql_dir)
+    if not shared and schema_script_count == 0:
+        logger.info('custom sql: 0 script(s)')
         return 0
 
     jobs: List[_SqlJob] = []
-    for path, rel in scripts:
-        folder, _, stem = rel.partition('/')
+    for path in shared:
+        stem = path.stem
         for schema in schema_list:
-            if folder == '_meta' and stem in per_schema.get(schema, {}):
+            if stem in per_schema[schema]:
                 continue
             jobs.append(
                 _SqlJob(
                     path=path,
                     schema=schema,
-                    target=target_root / schema.lower() / f'{rel}.md',
+                    target=(
+                        target_root / schema.lower() / CUSTOM_SQL_FOLDER / f'{stem}.md'
+                    ),
                 )
             )
     for schema in schema_list:
@@ -274,14 +225,16 @@ def dump_custom_sql(
                 _SqlJob(
                     path=path,
                     schema=schema,
-                    target=target_root / schema.lower() / '_meta' / f'{stem}.md',
+                    target=(
+                        target_root / schema.lower() / CUSTOM_SQL_FOLDER / f'{stem}.md'
+                    ),
                 )
             )
     workers = max(1, min(max_workers, len(jobs) or 1))
     logger.info(
         'custom sql: %d shared script(s), %d schema-specific for %d schema(s) '
         'jobs=%d workers=%d',
-        len(scripts),
+        len(shared),
         schema_script_count,
         len(schema_list),
         len(jobs),
