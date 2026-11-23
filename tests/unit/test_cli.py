@@ -44,6 +44,29 @@ def test_parse_login_and_flags():
     assert args.full is True
     assert args.object_types == ['TABLE', 'PACKAGE', 'PACKAGE BODY']
     assert args.dependencies is True
+    assert args.continue_on_error is False
+    assert args.skip_objects is None
+
+
+def test_parse_skip_and_continue_on_error():
+    args = parse_args(
+        [
+            '--db-url',
+            'oracle+oracledb://u:p@x',
+            '--schemas',
+            'scott',
+            '--output-dir',
+            'out',
+            '--skip-objects',
+            'ML_CALL_ROUTING.F_CALL_ROUTING_PREPARE,scott.package body.pkg_x',
+            '--continue-on-error',
+        ]
+    )
+    assert args.continue_on_error is True
+    assert args.skip_objects == [
+        'ML_CALL_ROUTING.F_CALL_ROUTING_PREPARE',
+        'scott.package body.pkg_x',
+    ]
 
 
 def test_unknown_object_type_errors():

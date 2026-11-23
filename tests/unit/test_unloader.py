@@ -8,7 +8,7 @@ import pytest
 
 from oracle_db_unloader.inventory import DbObject
 from oracle_db_unloader.state import get_last_unload_at, load_state, state_path
-from oracle_db_unloader.unloader import UnloadError, Unloader
+from oracle_db_unloader.unloader import UnloadError, Unloader, fetch_object_ddl
 
 
 def _obj(schema, name, object_type='TABLE', when=None):
@@ -21,14 +21,20 @@ def _obj(schema, name, object_type='TABLE', when=None):
     )
 
 
-def _ddl(tmp_path, object_types, schemas=None, **kwargs):
+def _ddl(tmp_path, object_types, schemas=None, full=False, lookback_minutes=0, **init_kwargs):
     Unloader(
         MagicMock(),
         schemas or ['SCOTT'],
         tmp_path,
         object_types=object_types,
         max_workers=1,
-    ).ddl(**kwargs)
+        **init_kwargs,
+    ).ddl(full=full, lookback_minutes=lookback_minutes)
+
+
+def test_continue_on_error_defaults_to_false(tmp_path):
+    client = Unloader(MagicMock(), ['SCOTT'], tmp_path, object_types=['table'])
+    assert client.continue_on_error is False
 
 
 def test_first_exception_stops_remaining_types_and_schemas(
@@ -56,13 +62,21 @@ def test_first_exception_stops_remaining_types_and_schemas(
 
     caplog.set_level(logging.INFO, logger='oracle_db_unloader')
     with pytest.raises(UnloadError, match='VIEW SCOTT.V_EMP'):
-        _ddl(tmp_path, ['table', 'view'], schemas=['SCOTT', 'HR'])
+        _ddl(
+            tmp_path,
+            ['table', 'view'],
+            schemas=['SCOTT', 'HR'],
+            continue_on_error=False,
+        )
 
     assert written == [('SCOTT', 'TABLE', 'EMP'), ('SCOTT', 'VIEW', 'V_EMP')]
     scott = load_state(tmp_path, 'SCOTT')
     assert get_last_unload_at(scott, 'TABLE') is not None
     assert get_last_unload_at(scott, 'VIEW') is None
     assert get_last_unload_at(load_state(tmp_path, 'HR'), 'TABLE') is None
+    assert not (tmp_path / 'hr').exists()
+    assert 'watermark not moved' not in caplog.text
+    assert 'failed to unload 1 object' not in caplog.text
 
 
 def test_same_type_failure_does_not_write_remaining(monkeypatch, tmp_path):
@@ -81,8 +95,9 @@ def test_same_type_failure_does_not_write_remaining(monkeypatch, tmp_path):
     monkeypatch.setattr('oracle_db_unloader.unloader.write_object', fake_write)
 
     with pytest.raises(UnloadError, match='TABLE SCOTT.T1'):
-        _ddl(tmp_path, ['table'])
+        _ddl(tmp_path, ['table'], continue_on_error=False)
     assert written == ['T1']
+    assert not (tmp_path / 'scott' / 'tables' / 't2.sql').exists()
 
 
 def test_progress_and_summary_logging(monkeypatch, tmp_path, caplog):
@@ -184,6 +199,100 @@ def test_dependencies_pass_max_workers(monkeypatch, tmp_path):
     )
     Unloader(MagicMock(), ['SCOTT'], tmp_path, max_workers=4).dependencies()
     assert seen['max_workers'] == 4
+
+
+def test_continue_on_error_writes_remaining_and_later_types(
+    monkeypatch, tmp_path, caplog
+):
+    written = []
+    inventory = [
+        _obj('SCOTT', 'T1'),
+        _obj('SCOTT', 'T2'),
+        _obj('SCOTT', 'V_EMP', 'VIEW'),
+    ]
+
+    monkeypatch.setattr(
+        'oracle_db_unloader.unloader.fetch_inventory',
+        lambda _engine, _schema: list(inventory),
+    )
+
+    def fake_write(_engine, obj, output_dir):
+        written.append((obj.object_type, obj.name))
+        if obj.name == 'T1':
+            raise RuntimeError('boom')
+        path = output_dir / obj.relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('-- ok\n', encoding='utf-8')
+
+    monkeypatch.setattr('oracle_db_unloader.unloader.write_object', fake_write)
+    caplog.set_level(logging.INFO, logger='oracle_db_unloader')
+
+    with pytest.raises(UnloadError, match='failed to unload 1 object'):
+        _ddl(tmp_path, ['table', 'view'], continue_on_error=True)
+
+    assert written == [('TABLE', 'T1'), ('TABLE', 'T2'), ('VIEW', 'V_EMP')]
+    assert (tmp_path / 'scott' / 'tables' / 't2.sql').is_file()
+    assert (tmp_path / 'scott' / 'views' / 'v_emp.sql').is_file()
+    assert not (tmp_path / 'scott' / 'tables' / 't1.sql').exists()
+    scott = load_state(tmp_path, 'SCOTT')
+    assert get_last_unload_at(scott, 'TABLE') is None
+    assert get_last_unload_at(scott, 'VIEW') is not None
+    assert 'watermark not moved' in caplog.text
+
+
+def test_skip_objects_are_not_written(monkeypatch, tmp_path, caplog):
+    written = []
+    monkeypatch.setattr(
+        'oracle_db_unloader.unloader.fetch_inventory',
+        lambda _engine, _schema: [
+            _obj('SCOTT', 'T1'),
+            _obj('SCOTT', 'T2'),
+            _obj('SCOTT', 'FN', 'FUNCTION'),
+        ],
+    )
+
+    def fake_write(_engine, obj, output_dir):
+        written.append(obj.name)
+        path = output_dir / obj.relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('-- ok\n', encoding='utf-8')
+
+    monkeypatch.setattr('oracle_db_unloader.unloader.write_object', fake_write)
+    caplog.set_level(logging.WARNING, logger='oracle_db_unloader')
+    _ddl(
+        tmp_path,
+        ['table', 'function'],
+        skip_objects=['SCOTT.T1', 'scott.function.fn'],
+    )
+    assert written == ['T2']
+    assert 'skipped TABLE SCOTT.T1' in caplog.text
+    assert 'skipped FUNCTION SCOTT.FN' in caplog.text
+    assert get_last_unload_at(load_state(tmp_path, 'SCOTT'), 'TABLE') is not None
+
+
+def test_fetch_object_ddl_falls_back_to_get_ddl():
+    obj = _obj('SCOTT', 'PKG', 'PACKAGE BODY')
+    conn = MagicMock()
+    calls = []
+
+    def execute(_stmt, params):
+        calls.append(dict(params))
+        if len(calls) == 1:
+            raise UnicodeDecodeError(
+                'utf-8', b'\xd1', 3999, 4000, 'unexpected end of data'
+            )
+        rows = MagicMock()
+        rows.returns_rows = True
+        rows.__iter__.return_value = iter(
+            [('CREATE OR REPLACE PACKAGE BODY pkg\nEND;\n/\n',)]
+        )
+        return rows
+
+    conn.execute.side_effect = execute
+    ddl = fetch_object_ddl(conn, obj)
+    assert 'package body pkg' in ddl.lower()
+    assert calls[0]['obj_type'] == 'PACKAGE BODY'
+    assert calls[1]['obj_type'] == 'PACKAGE_BODY'
 
 
 def test_custom_sql_pass_max_workers(monkeypatch, tmp_path):

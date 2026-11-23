@@ -41,10 +41,21 @@ seen in Oracle. For tables and materialized views that value is
 The next run writes objects whose ``last_ddl_time`` is greater than or
 equal to that watermark. `--full` ignores watermarks and rewrites every
 selected object. `--lookback-minutes` (default 0) can widen the cutoff.
-Any exception stops the whole run: remaining types and schemas are not
-started, and the failed type's watermark is not moved. `--log-level
-DEBUG|INFO|WARNING|ERROR` (default `INFO`) configures the CLI logger. Importing
-the library does not attach handlers; the host process owns logging.
+By default any object exception stops the whole run: remaining types and
+schemas are not started, and the failed type's watermark is not moved.
+`--continue-on-error` keeps going through remaining objects, types, and
+schemas; failed types still do not move their watermark, and the process
+exits non-zero if anything failed. `--skip-objects SCHEMA.NAME,SCHEMA.TYPE.NAME`
+omits specific objects (type is optional; `package body` and `package_body`
+are the same). `--log-level DEBUG|INFO|WARNING|ERROR` (default `INFO`)
+configures the CLI logger. Importing the library does not attach handlers;
+the host process owns logging.
+
+Functions, procedures, packages, types, and triggers are read from
+`dba_source` and concatenated on the server as a CLOB, so a UTF-8 character
+split across Oracle's 4000-byte source wrap is rejoined before it reaches
+the client. If that still fails, the unloader falls back to
+`dbms_metadata.get_ddl`.
 
 Quoted mixed-case names such as `"MixedCase_metrics"` are passed to
 `dbms_metadata.get_ddl` as stored in the dictionary (not uppercased). File
@@ -84,6 +95,8 @@ try:
         object_types=['table', 'package'],
         output_dir='/data/ddl',
         max_workers=5,
+        skip_objects=['SCOTT.BROKEN_FN'],
+        continue_on_error=True,
     )
     client.ddl()
     client.dependencies()

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, NoReturn, Optional, Sequence, Set, Union
+from typing import Dict, FrozenSet, Iterable, List, NoReturn, Optional, Sequence, Set, Union
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
@@ -14,12 +14,16 @@ from .dependencies import dump_dependencies
 from .dml import dump_custom_sql
 from .inventory import (
     HEADER_TYPES,
+    SOURCE_METADATA_SQL,
     SOURCE_TYPES,
     UNLOAD_SQL,
     DbObject,
     fetch_inventory,
+    metadata_object_type,
     next_watermark,
     normalize_object_types,
+    normalize_skip_objects,
+    object_is_skipped,
     plan_actions,
     walk_schema_files,
 )
@@ -58,19 +62,30 @@ class RunStats:
     added: int = 0
     updated: int = 0
     deleted: int = 0
+    skipped: int = 0
+    failed: int = 0
+    failures: List[str] = field(default_factory=list)
 
-    def add(self, added: int = 0, updated: int = 0, deleted: int = 0) -> None:
+    def add(
+        self,
+        added: int = 0,
+        updated: int = 0,
+        deleted: int = 0,
+        skipped: int = 0,
+        failed: int = 0,
+    ) -> None:
         self.added += added
         self.updated += updated
         self.deleted += deleted
+        self.skipped += skipped
+        self.failed += failed
 
 
-def fetch_object_ddl(conn: Connection, obj: DbObject) -> str:
-    sql_name = UNLOAD_SQL[obj.object_type]
+def _fetch_ddl_sql(conn: Connection, obj: DbObject, sql_name: str, obj_type: str) -> str:
     params = {
         'schema': obj.owner,
         'obj_name': obj.name,
-        'obj_type': obj.object_type,
+        'obj_type': obj_type,
     }
     parts: List[str] = []
     for statement in split_statements(load_sql(sql_name)):
@@ -88,6 +103,37 @@ def fetch_object_ddl(conn: Connection, obj: DbObject) -> str:
         if not stripped.endswith('/'):
             ddl = stripped + '\n/\n'
     return ddl
+
+
+def fetch_object_ddl(conn: Connection, obj: DbObject) -> str:
+    sql_name = UNLOAD_SQL[obj.object_type]
+    try:
+        return _fetch_ddl_sql(conn, obj, sql_name, obj.object_type)
+    except Exception as source_exc:
+        if obj.object_type not in SOURCE_TYPES:
+            raise
+        logger.warning(
+            'dba_source failed for %s %s.%s (%s); falling back to dbms_metadata.get_ddl',
+            obj.object_type,
+            obj.owner,
+            obj.name,
+            source_exc,
+        )
+        try:
+            return _fetch_ddl_sql(
+                conn,
+                obj,
+                SOURCE_METADATA_SQL,
+                metadata_object_type(obj.object_type),
+            )
+        except Exception as meta_exc:
+            logger.exception(
+                'dbms_metadata.get_ddl fallback failed for %s %s.%s',
+                obj.object_type,
+                obj.owner,
+                obj.name,
+            )
+            raise source_exc from meta_exc
 
 
 def write_object(engine: Engine, obj: DbObject, output_dir: Path) -> None:
@@ -166,6 +212,7 @@ def _write_objects(
     stats: RunStats,
     schema: str,
     object_type: str,
+    continue_on_error: bool,
 ) -> None:
     remaining_writes = len(to_write)
     if not to_write:
@@ -184,6 +231,8 @@ def _write_objects(
             done, _pending = wait(futures, return_when=FIRST_COMPLETED)
             for future in done:
                 obj = futures.pop(future)
+                remaining_writes -= 1
+                failed = False
                 try:
                     future.result()
                 except Exception as exc:
@@ -193,22 +242,26 @@ def _write_objects(
                         obj.owner,
                         obj.name,
                     )
-                    raise UnloadError(
-                        f'failed to unload {obj.object_type} {obj.owner}.{obj.name}'
-                    ) from exc
-                remaining_writes -= 1
-                if obj.relpath in disk:
-                    stats.add(updated=1)
-                else:
-                    stats.add(added=1)
-                logger.info(
-                    'unloaded %s schema=%s type=%s remaining=%d delete=%d',
-                    (output_dir / obj.relpath).as_posix(),
-                    schema,
-                    object_type,
-                    remaining_writes,
-                    remaining_deletes,
-                )
+                    if not continue_on_error:
+                        raise UnloadError(
+                            f'failed to unload {obj.object_type} {obj.owner}.{obj.name}'
+                        ) from exc
+                    failed = True
+                    stats.add(failed=1)
+                    stats.failures.append(f'{obj.object_type} {obj.owner}.{obj.name}')
+                if not failed:
+                    if obj.relpath in disk:
+                        stats.add(updated=1)
+                    else:
+                        stats.add(added=1)
+                    logger.info(
+                        'unloaded %s schema=%s type=%s remaining=%d delete=%d',
+                        (output_dir / obj.relpath).as_posix(),
+                        schema,
+                        object_type,
+                        remaining_writes,
+                        remaining_deletes,
+                    )
                 nxt = next(iterator, None)
                 if nxt is not None:
                     futures[pool.submit(write_object, engine, nxt, output_dir)] = nxt
@@ -230,21 +283,37 @@ def _unload_object_type(
     max_workers: int,
     full: bool,
     stats: RunStats,
-) -> None:
+    skip_objects: FrozenSet[str],
+    continue_on_error: bool,
+) -> int:
     disk = walk_schema_files(output_dir, schema, [object_type])
     watermark = None if full else last_unload_at
     to_write, to_delete = plan_actions(objects, disk, watermark, lookback_minutes)
+    skipped = [obj for obj in to_write if object_is_skipped(obj, skip_objects)]
+    if skipped:
+        skip_names = {obj.relpath for obj in skipped}
+        to_write = [obj for obj in to_write if obj.relpath not in skip_names]
+        stats.add(skipped=len(skipped))
+        for obj in skipped:
+            logger.warning(
+                'skipped %s %s.%s',
+                obj.object_type,
+                obj.owner,
+                obj.name,
+            )
     workers = max(1, min(max_workers, len(to_write) or 1))
     logger.info(
-        'schema %s type %s: inventory=%d write=%d delete=%d workers=%d watermark=%s',
+        'schema %s type %s: inventory=%d write=%d delete=%d skip=%d workers=%d watermark=%s',
         schema,
         object_type,
         len(objects),
         len(to_write),
         len(to_delete),
+        len(skipped),
         workers,
         watermark.isoformat() if watermark else 'none',
     )
+    failed_before = stats.failed
     _write_objects(
         engine,
         to_write,
@@ -255,6 +324,7 @@ def _unload_object_type(
         stats=stats,
         schema=schema,
         object_type=object_type,
+        continue_on_error=continue_on_error,
     )
     deleted = _delete_files(
         output_dir,
@@ -264,6 +334,7 @@ def _unload_object_type(
         object_type=object_type,
     )
     stats.add(deleted=deleted)
+    return stats.failed - failed_before
 
 
 def unload_schema(
@@ -276,6 +347,8 @@ def unload_schema(
     max_workers: int,
     full: bool,
     stats: RunStats,
+    skip_objects: FrozenSet[str],
+    continue_on_error: bool,
 ) -> None:
     inventory = fetch_inventory(engine, schema)
     by_type: Dict[str, List[DbObject]] = {
@@ -287,7 +360,7 @@ def unload_schema(
 
     state = load_state(output_dir, schema)
     for object_type in object_types:
-        _unload_object_type(
+        type_failed = _unload_object_type(
             engine,
             schema,
             object_type,
@@ -298,7 +371,23 @@ def unload_schema(
             max_workers=max_workers,
             full=full,
             stats=stats,
+            skip_objects=skip_objects,
+            continue_on_error=continue_on_error,
         )
+        if type_failed:
+            logger.warning(
+                'schema %s type %s: watermark not moved, %d object(s) failed',
+                schema,
+                object_type,
+                type_failed,
+            )
+            logger.info(
+                'schema %s type %s: done watermark=%s',
+                schema,
+                object_type,
+                'unchanged',
+            )
+            continue
         watermark = next_watermark(
             get_last_unload_at(state, object_type),
             by_type[object_type],
@@ -329,7 +418,15 @@ class Unloader:
         *,
         max_workers: int = 5,
         object_types: Optional[Sequence[str]] = None,
+        skip_objects: Optional[Sequence[str]] = None,
+        continue_on_error: bool = False,
     ) -> None:
+        """Create an unloader.
+
+        ``continue_on_error`` defaults to False: the first object error
+        aborts the run, remaining types and schemas are not started, and
+        the failed type's watermark is not moved.
+        """
         if max_workers < 1:
             raise ValueError('max_workers must be >= 1')
         self.engine = engine
@@ -338,6 +435,8 @@ class Unloader:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.max_workers = max_workers
         self.object_types = normalize_object_types(object_types)
+        self.skip_objects = normalize_skip_objects(skip_objects)
+        self.continue_on_error = continue_on_error
 
     def ddl(self, *, full: bool = False, lookback_minutes: int = 0) -> RunStats:
         """Incremental object DDL into ``schema/<type>/*.sql``."""
@@ -358,10 +457,12 @@ class Unloader:
             self._fail(stats, started, exc, label='ddl')
         elapsed = time.perf_counter() - started
         logger.info(
-            'ddl complete added=%d updated=%d deleted=%d in %.1fs',
+            'ddl complete added=%d updated=%d deleted=%d skipped=%d failed=%d in %.1fs',
             stats.added,
             stats.updated,
             stats.deleted,
+            stats.skipped,
+            stats.failed,
             elapsed,
         )
         return stats
@@ -405,8 +506,17 @@ class Unloader:
                 max_workers=self.max_workers,
                 full=full,
                 stats=stats,
+                skip_objects=self.skip_objects,
+                continue_on_error=self.continue_on_error,
             )
             logger.info('schema %s: done', schema)
+        if stats.failures:
+            preview = ', '.join(stats.failures[:10])
+            if len(stats.failures) > 10:
+                preview += f', ... ({len(stats.failures)} total)'
+            raise UnloadError(
+                f'failed to unload {len(stats.failures)} object(s): {preview}'
+            )
 
     def _fail(
         self,
@@ -418,11 +528,13 @@ class Unloader:
     ) -> NoReturn:
         elapsed = time.perf_counter() - started
         logger.error(
-            '%s failed added=%d updated=%d deleted=%d (%.1fs)',
+            '%s failed added=%d updated=%d deleted=%d skipped=%d failed=%d (%.1fs)',
             label,
             stats.added,
             stats.updated,
             stats.deleted,
+            stats.skipped,
+            stats.failed,
             elapsed,
         )
         if isinstance(exc, UnloadError):

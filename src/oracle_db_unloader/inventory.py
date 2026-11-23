@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Set, Tuple
+from typing import FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -47,6 +47,8 @@ UNLOAD_SQL = {
     'SYNONYM': 'unload_synonym.sql',
 }
 
+SOURCE_METADATA_SQL = 'unload_source_ddl.sql'
+
 SOURCE_TYPES = {
     'PACKAGE',
     'PACKAGE BODY',
@@ -55,6 +57,12 @@ SOURCE_TYPES = {
     'TRIGGER',
     'TYPE',
     'TYPE BODY',
+}
+
+# dbms_metadata.get_ddl uses underscores for body types.
+METADATA_OBJECT_TYPES = {
+    'PACKAGE BODY': 'PACKAGE_BODY',
+    'TYPE BODY': 'TYPE_BODY',
 }
 
 HEADER_TYPES = {'TABLE', 'MATERIALIZED VIEW'}
@@ -117,6 +125,38 @@ def normalize_object_types(values: Optional[Sequence[str]] = None) -> List[str]:
     if not selected:
         return list(ALL_OBJECT_TYPES)
     return selected
+
+
+def metadata_object_type(object_type: str) -> str:
+    """Oracle dictionary type -> dbms_metadata.get_ddl object_type."""
+    return METADATA_OBJECT_TYPES.get(object_type, object_type)
+
+
+def normalize_skip_objects(values: Optional[Sequence[str]] = None) -> FrozenSet[str]:
+    """Parse ``SCHEMA.NAME`` or ``SCHEMA.TYPE.NAME`` skip keys.
+
+    Type tokens accept spaces or underscores (``package body`` /
+    ``PACKAGE_BODY``). Matching is case-insensitive.
+    """
+    skip: Set[str] = set()
+    for raw in values or ():
+        token = ' '.join(raw.strip().split())
+        if not token:
+            continue
+        skip.add(token.upper().replace(' ', '_'))
+    return frozenset(skip)
+
+
+def object_is_skipped(obj: DbObject, skip_objects: FrozenSet[str]) -> bool:
+    if not skip_objects:
+        return False
+    owner = obj.owner.upper()
+    name = obj.name.upper()
+    typ = obj.object_type.upper().replace(' ', '_')
+    return (
+        f'{owner}.{name}' in skip_objects
+        or f'{owner}.{typ}.{name}' in skip_objects
+    )
 
 
 @dataclass(frozen=True)

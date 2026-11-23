@@ -26,6 +26,11 @@ def test_unload_scripts_use_bind_variables():
         assert 'schema' in binds, path.name
         assert 'obj_name' in binds, path.name
         assert 'upper(:obj_name)' not in sql, path.name
+    source = (SQL_DIR / 'unload_source.sql').read_text(encoding='utf-8').lower()
+    assert 'xmlagg' in source
+    assert 'dba_source' in source
+    metadata = (SQL_DIR / 'unload_source_ddl.sql').read_text(encoding='utf-8').lower()
+    assert 'dbms_metadata.get_ddl' in metadata
 
 
 def test_inventory_tracks_partitions_and_indexes():

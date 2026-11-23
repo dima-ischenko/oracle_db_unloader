@@ -77,6 +77,25 @@ def build_parser() -> argparse.ArgumentParser:
             '<schema>/_deps/. Independent of DDL watermarks; always a full refresh.'
         ),
     )
+    parser.add_argument(
+        '--skip-objects',
+        dest='skip_objects',
+        default=None,
+        help=(
+            'Comma-separated objects to skip: SCHEMA.NAME or SCHEMA.TYPE.NAME. '
+            'TYPE accepts spaces or underscores (package_body, PACKAGE BODY).'
+        ),
+    )
+    parser.add_argument(
+        '--continue-on-error',
+        dest='continue_on_error',
+        action='store_true',
+        help=(
+            'Keep unloading remaining objects, types, and schemas after an '
+            'object fails. Failed types do not move their watermark. The run '
+            'still exits non-zero if any object failed.'
+        ),
+    )
     return parser
 
 
@@ -96,6 +115,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             parser.error(str(exc))
     else:
         args.object_types = None
+    if args.skip_objects:
+        args.skip_objects = _split_csv(args.skip_objects)
+    else:
+        args.skip_objects = None
     return args
 
 
@@ -140,6 +163,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             output_dir=args.output_dir,
             max_workers=args.max_workers,
             object_types=args.object_types,
+            skip_objects=args.skip_objects,
+            continue_on_error=args.continue_on_error,
         )
         client.ddl(full=args.full, lookback_minutes=args.lookback_minutes)
         if args.dependencies:

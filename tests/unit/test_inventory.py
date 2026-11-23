@@ -8,9 +8,12 @@ from oracle_db_unloader.inventory import (
     ALL_OBJECT_TYPES,
     DbObject,
     max_last_ddl_time,
+    metadata_object_type,
     next_watermark,
     normalize_object_types,
+    normalize_skip_objects,
     object_deps_relpath,
+    object_is_skipped,
     object_relpath,
     plan_actions,
     walk_schema_files,
@@ -117,3 +120,25 @@ def test_walk_schema_files_filters_by_type_suffix(tmp_path):
     assert walk_schema_files(tmp_path, 'SCOTT', ['PACKAGE BODY']) == {
         'scott/packages/pkg_x_b.sql'
     }
+
+
+def test_metadata_object_type_maps_bodies():
+    assert metadata_object_type('FUNCTION') == 'FUNCTION'
+    assert metadata_object_type('PACKAGE BODY') == 'PACKAGE_BODY'
+    assert metadata_object_type('TYPE BODY') == 'TYPE_BODY'
+
+
+def test_skip_objects_match_name_or_type():
+    skip = normalize_skip_objects(
+        ['scott.t1', 'HR.package body.PKG_X', '  ']
+    )
+    assert object_is_skipped(_obj('T1', 'TABLE', datetime(2026, 1, 1)), skip)
+    assert not object_is_skipped(_obj('T2', 'TABLE', datetime(2026, 1, 1)), skip)
+    assert object_is_skipped(
+        _obj('PKG_X', 'PACKAGE BODY', datetime(2026, 1, 1), schema='HR'),
+        skip,
+    )
+    assert not object_is_skipped(
+        _obj('PKG_X', 'PACKAGE', datetime(2026, 1, 1), schema='HR'),
+        skip,
+    )
