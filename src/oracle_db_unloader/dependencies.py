@@ -4,7 +4,7 @@ from collections import defaultdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, FrozenSet, Iterable, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -79,16 +79,62 @@ def fetch_dependency_edges(engine: Engine) -> List[Tuple[Node, Node]]:
     return edges
 
 
-def dependency_rows(graph: DependencyGraph, root: Node) -> List[DepRow]:
-    rows = _walk_upstream(graph, root)
+def plscope_dml_available(engine: Engine) -> bool:
+    sql = load_sql('dml_target_probe.sql')
+    with engine.connect() as conn:
+        return conn.execute(text(sql)).first() is not None
+
+
+def fetch_dml_writers(
+    engine: Engine,
+) -> Optional[Dict[Node, FrozenSet[Node]]]:
+    if not plscope_dml_available(engine):
+        logger.info(
+            'dependencies: PL/Scope DML statements not found, skip writes split'
+        )
+        return None
+    sql = load_sql('dml_target_edges.sql')
+    collected: Dict[Node, Set[Node]] = defaultdict(set)
+    with engine.connect() as conn:
+        for table_owner, table_name, owner, name, typ in conn.execute(text(sql)):
+            table = Node(str(table_owner), str(table_name), 'TABLE')
+            collected[table].add(Node(str(owner), str(name), str(typ)))
+    writers = {key: frozenset(value) for key, value in collected.items()}
+    logger.info(
+        'dependencies: loaded %d PL/Scope DML target table(s)',
+        len(writers),
+    )
+    return writers
+
+
+def dependency_rows(
+    graph: DependencyGraph,
+    root: Node,
+    writers: Optional[Dict[Node, FrozenSet[Node]]] = None,
+) -> List[DepRow]:
+    writer_set: Optional[FrozenSet[Node]] = None
+    if root.type == 'TABLE' and writers is not None:
+        writer_set = writers.get(root, frozenset())
+    rows = _walk_upstream(graph, root, writer_set)
     rows.extend(_walk_downstream(graph, root))
-    rows.sort(key=lambda row: (row.ref_type != 'downstream', row.xref_path))
+    section_order = {
+        'downstream': 0,
+        'upstream_write': 1,
+        'upstream_read': 2,
+        'upstream': 3,
+    }
+    rows.sort(key=lambda row: (section_order.get(row.ref_type, 9), row.xref_path))
     return rows
 
 
 def format_dep_markdown(rows: Sequence[DepRow]) -> str:
     sections: List[str] = []
-    for title, ref_type in (('Downstream', 'downstream'), ('Upstream', 'upstream')):
+    for title, ref_type in (
+        ('Downstream', 'downstream'),
+        ('Upstream writes', 'upstream_write'),
+        ('Upstream reads', 'upstream_read'),
+        ('Upstream', 'upstream'),
+    ):
         paths = [row.xref_path for row in rows if row.ref_type == ref_type]
         if not paths:
             continue
@@ -100,9 +146,19 @@ def _neighbors(mapping: Dict[Node, Tuple[Node, ...]], node: Node) -> Tuple[Node,
     return mapping.get(node, ())
 
 
-def _walk_upstream(graph: DependencyGraph, root: Node) -> List[DepRow]:
+def _walk_upstream(
+    graph: DependencyGraph,
+    root: Node,
+    writer_set: Optional[FrozenSet[Node]] = None,
+) -> List[DepRow]:
     rows: List[DepRow] = []
     for first in _neighbors(graph.dependents, root):
+        if writer_set is None:
+            ref_type = 'upstream'
+        elif first in writer_set:
+            ref_type = 'upstream_write'
+        else:
+            ref_type = 'upstream_read'
         stack: List[Tuple[Node, Tuple[Node, ...]]] = [(first, (first,))]
         while stack:
             current, path = stack.pop()
@@ -118,7 +174,7 @@ def _walk_upstream(graph: DependencyGraph, root: Node) -> List[DepRow]:
             rows.append(
                 DepRow(
                     xref_path=_format_xref(reversed(path), toward_root=True),
-                    ref_type='upstream',
+                    ref_type=ref_type,
                 )
             )
     return rows
@@ -191,9 +247,12 @@ def _walk_type_deps_files(output_dir: Path, schema: str, object_type: str) -> Se
 
 
 def _write_object_deps(
-    output_dir: Path, obj: DbObject, graph: DependencyGraph
+    output_dir: Path,
+    obj: DbObject,
+    graph: DependencyGraph,
+    writers: Optional[Dict[Node, FrozenSet[Node]]] = None,
 ) -> Tuple[Optional[str], int]:
-    rows = dependency_rows(graph, node_from_object(obj))
+    rows = dependency_rows(graph, node_from_object(obj), writers)
     if not rows:
         return None, 0
     relpath = obj.deps_relpath
@@ -209,6 +268,7 @@ def _write_dep_objects(
     to_process: Sequence[DbObject],
     graph: DependencyGraph,
     workers: int,
+    writers: Optional[Dict[Node, FrozenSet[Node]]] = None,
 ) -> Tuple[Set[str], int]:
     remaining = len(to_process)
     iterator = iter(to_process)
@@ -221,7 +281,9 @@ def _write_dep_objects(
             obj = next(iterator, None)
             if obj is None:
                 break
-            futures[pool.submit(_write_object_deps, output_dir, obj, graph)] = obj
+            futures[
+                pool.submit(_write_object_deps, output_dir, obj, graph, writers)
+            ] = obj
         while futures:
             done, _pending = wait(futures, return_when=FIRST_COMPLETED)
             for future in done:
@@ -254,7 +316,7 @@ def _write_dep_objects(
                 nxt = next(iterator, None)
                 if nxt is not None:
                     futures[
-                        pool.submit(_write_object_deps, output_dir, nxt, graph)
+                        pool.submit(_write_object_deps, output_dir, nxt, graph, writers)
                     ] = nxt
     finally:
         for future in list(futures):
@@ -269,6 +331,7 @@ def write_schema_dependencies(
     inventory: Sequence[DbObject],
     object_types: Sequence[str],
     graph: DependencyGraph,
+    writers: Optional[Dict[Node, FrozenSet[Node]]] = None,
     *,
     max_workers: int = 5,
 ) -> int:
@@ -286,7 +349,7 @@ def write_schema_dependencies(
     written = 0
     if to_process:
         known, written = _write_dep_objects(
-            output_dir, schema, to_process, graph, workers
+            output_dir, schema, to_process, graph, workers, writers
         )
 
     stale = walk_deps_files(output_dir, schema, object_types) - known
@@ -318,6 +381,7 @@ def dump_dependencies(
     if not schema_list:
         return 0
     edges = fetch_dependency_edges(engine)
+    writers = fetch_dml_writers(engine)
     logger.info(
         'dependencies: loaded %d edge(s) for %d schema(s) max_workers=%d',
         len(edges),
@@ -334,6 +398,7 @@ def dump_dependencies(
             inventory,
             object_types,
             graph,
+            writers,
             max_workers=max_workers,
         )
     logger.info('dependencies: wrote %d file(s)', dumped)

@@ -18,7 +18,9 @@ begin
              'SYN_EMP',
              'CURRENCY_DICT',
              'MixedCase_metrics',
-             'EMP_HEAP_NAME_I'
+             'EMP_HEAP_NAME_I',
+             'P_EMP_HEAP_LOAD',
+             'P_EMP_HEAP_READ'
            )
   ) loop
     begin
@@ -38,6 +40,7 @@ end;
 """
 
 CREATE_STATEMENTS = [
+    "alter session set plscope_settings = 'identifiers:all, statements:all'",
     """
     create table emp_heap (
       id number primary key,
@@ -108,6 +111,19 @@ CREATE_STATEMENTS = [
     """,
     "insert into currency_dict (code, name) values ('USD', 'US Dollar')",
     "insert into currency_dict (code, name) values ('EUR', null)",
+    """
+    create or replace procedure p_emp_heap_load as
+    begin
+      insert into emp_heap (id, name) values (4, 'dave');
+    end;
+    """,
+    """
+    create or replace procedure p_emp_heap_read as
+      n number;
+    begin
+      select count(*) into n from emp_heap;
+    end;
+    """,
 ]
 
 

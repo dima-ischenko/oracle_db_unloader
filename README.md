@@ -71,10 +71,16 @@ overrides a shared `_meta` script of the same name). Results are written as
 
 `--dependencies` writes per-object leaf paths under `<schema>/_deps/<type>/`
 with `## Downstream` (sources, path starts with `>`) and `## Upstream`
-(consumers, path ends with `>`). The object's own name is omitted from
-each path. That pass always refreshes the selected types: a new consumer
-in another schema does not change the object's `last_ddl_time`. DDL
-watermarks are not used. Off by default.
+(consumers, path ends with `>`). For tables, when PL/Scope statement
+metadata is present, `## Upstream` is replaced by `## Upstream writes`
+(DML targeting the table) and `## Upstream reads` (everyone else). If
+PL/Scope has no DML statements, table files keep a single `## Upstream`.
+Empty sections are omitted. The object's own name is omitted from each
+path. That pass always refreshes the selected types: a new consumer in
+another schema does not change the object's `last_ddl_time`. DDL
+watermarks are not used. Off by default. Classification is at object
+level (a package body is a writer if any of its procedures DML the
+table). Dynamic SQL is not visible to PL/Scope.
 
 ## Library
 
@@ -132,9 +138,10 @@ partition by ...` statement (template only, no per-partition lists). Custom
 under every schema; `<schema>/_meta/*.sql` writes only to that schema.
 
 `--dependencies` writes `<schema>/_deps/<type>/<object>.md` with
-`## Downstream` / `## Upstream` sections of leaf paths. Objects with no
-edges produce no file; stale `_deps` files for the selected types are
-removed.
+`## Downstream` / `## Upstream` sections of leaf paths. When PL/Scope is
+available, table files use `## Upstream writes` / `## Upstream reads`
+instead of `## Upstream`. Objects with no edges produce no file; stale
+`_deps` files for the selected types are removed.
 
 ## Tests
 

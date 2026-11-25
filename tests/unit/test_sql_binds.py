@@ -38,6 +38,7 @@ def test_inventory_tracks_partitions_and_indexes():
     assert ':schema' in inventory
     assert 'TABLE PARTITION' in inventory
     assert 'dba_indexes' in inventory
+    assert "not like '%#%'" in inventory.lower()
     transform = (SQL_DIR / 'set_transform_params.sql').read_text(encoding='utf-8')
     assert 'EMIT_SCHEMA' in transform
 
@@ -51,6 +52,21 @@ def test_dependency_edges_are_uncycled_catalog_dump():
     assert ':schema' not in sql
     for marker in SQLPLUS_MARKERS:
         assert marker not in lowered
+
+
+def test_dml_target_sql_is_uncycled_catalog_dump():
+    probe = (SQL_DIR / 'dml_target_probe.sql').read_text(encoding='utf-8')
+    edges = (SQL_DIR / 'dml_target_edges.sql').read_text(encoding='utf-8')
+    for sql in (probe, edges):
+        lowered = sql.lower()
+        assert 'dba_statements' in lowered
+        assert "'sys'" in lowered
+        assert ':schema' not in sql
+        for marker in SQLPLUS_MARKERS:
+            assert marker not in lowered
+    assert 'dba_identifiers' in edges.lower()
+    assert 'dba_synonyms' in edges.lower()
+    assert 'insert' in edges.lower()
 
 
 def test_split_statements_on_slash():

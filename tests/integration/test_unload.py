@@ -148,8 +148,16 @@ def test_dependencies_write_view_to_table_paths(fresh_schema, tmp_path):
     assert '## Downstream' in view_text
     assert '> test.emp_heap(table)' in view_text
     assert 'emp_v(view)' not in view_text
-    assert '## Upstream' in table_text
+    assert '## Upstream writes' in table_text
+    assert 'test.p_emp_heap_load(procedure) >' in table_text
+    assert '## Upstream reads' in table_text
+    assert '## Upstream\n' not in table_text
     assert 'test.emp_v(view) >' in table_text
+    assert 'test.p_emp_heap_read(procedure) >' in table_text
+    writes, sep, rest = table_text.partition('## Upstream reads\n')
+    assert sep
+    assert 'p_emp_heap_load' in writes
+    assert 'p_emp_heap_load' not in rest
     assert 'emp_heap(table)' not in table_text
     assert not (
         Path(tmp_path) / 'test' / '_deps' / 'tables' / 'currency_dict.md'

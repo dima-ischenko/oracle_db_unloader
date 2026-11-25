@@ -74,7 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help=(
             'Write per-object upstream/downstream dependency trees under '
-            '<schema>/_deps/. Independent of DDL watermarks; always a full refresh.'
+            '<schema>/_deps/. Table files use ## Upstream writes / ## Upstream '
+            'reads when PL/Scope is available. Independent of DDL watermarks; '
+            'always a full refresh.'
         ),
     )
     parser.add_argument(

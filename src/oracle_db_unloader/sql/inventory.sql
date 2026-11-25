@@ -41,6 +41,7 @@ select owner,
          where t.owner = upper(:schema)
            and t.object_type in ('TABLE', 'MATERIALIZED VIEW')
            and t.object_name not like 'RB$%'
+           and t.object_name not like '%#%'
            and not (
                  t.object_type = 'TABLE'
                  and exists (
