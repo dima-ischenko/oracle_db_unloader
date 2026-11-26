@@ -20,6 +20,10 @@ from .resources import load_sql
 
 logger = get_logger(__name__)
 
+DML_UNIT_TYPES = frozenset(
+    {'FUNCTION', 'PROCEDURE', 'PACKAGE BODY', 'TRIGGER', 'TYPE BODY'}
+)
+
 
 @dataclass(frozen=True)
 class Node:
@@ -107,21 +111,41 @@ def fetch_dml_writers(
     return writers
 
 
+def invert_dml_writers(
+    writers: Optional[Dict[Node, FrozenSet[Node]]],
+) -> Optional[Dict[Node, FrozenSet[Node]]]:
+    if writers is None:
+        return None
+    collected: Dict[Node, Set[Node]] = defaultdict(set)
+    for table, units in writers.items():
+        for unit in units:
+            collected[unit].add(table)
+    return {key: frozenset(value) for key, value in collected.items()}
+
+
 def dependency_rows(
     graph: DependencyGraph,
     root: Node,
     writers: Optional[Dict[Node, FrozenSet[Node]]] = None,
+    written: Optional[Dict[Node, FrozenSet[Node]]] = None,
 ) -> List[DepRow]:
     writer_set: Optional[FrozenSet[Node]] = None
     if root.type == 'TABLE' and writers is not None:
         writer_set = writers.get(root, frozenset())
+    write_targets: Optional[FrozenSet[Node]] = None
+    if root.type in DML_UNIT_TYPES and writers is not None:
+        if written is None:
+            written = invert_dml_writers(writers)
+        write_targets = written.get(root, frozenset())
     rows = _walk_upstream(graph, root, writer_set)
-    rows.extend(_walk_downstream(graph, root))
+    rows.extend(_walk_downstream(graph, root, write_targets))
     section_order = {
-        'downstream': 0,
-        'upstream_write': 1,
-        'upstream_read': 2,
-        'upstream': 3,
+        'downstream_write': 0,
+        'downstream_read': 1,
+        'downstream': 2,
+        'upstream_write': 3,
+        'upstream_read': 4,
+        'upstream': 5,
     }
     rows.sort(key=lambda row: (section_order.get(row.ref_type, 9), row.xref_path))
     return rows
@@ -130,6 +154,8 @@ def dependency_rows(
 def format_dep_markdown(rows: Sequence[DepRow]) -> str:
     sections: List[str] = []
     for title, ref_type in (
+        ('Downstream writes', 'downstream_write'),
+        ('Downstream reads', 'downstream_read'),
         ('Downstream', 'downstream'),
         ('Upstream writes', 'upstream_write'),
         ('Upstream reads', 'upstream_read'),
@@ -180,9 +206,19 @@ def _walk_upstream(
     return rows
 
 
-def _walk_downstream(graph: DependencyGraph, root: Node) -> List[DepRow]:
+def _walk_downstream(
+    graph: DependencyGraph,
+    root: Node,
+    write_targets: Optional[FrozenSet[Node]] = None,
+) -> List[DepRow]:
     rows: List[DepRow] = []
     for first in _neighbors(graph.references, root):
+        if write_targets is None:
+            ref_type = 'downstream'
+        elif first in write_targets:
+            ref_type = 'downstream_write'
+        else:
+            ref_type = 'downstream_read'
         stack: List[Tuple[Node, Tuple[Node, ...]]] = [(first, (first,))]
         while stack:
             current, path = stack.pop()
@@ -198,7 +234,7 @@ def _walk_downstream(graph: DependencyGraph, root: Node) -> List[DepRow]:
             rows.append(
                 DepRow(
                     xref_path=_format_xref(path, toward_root=False),
-                    ref_type='downstream',
+                    ref_type=ref_type,
                 )
             )
     return rows
@@ -251,8 +287,9 @@ def _write_object_deps(
     obj: DbObject,
     graph: DependencyGraph,
     writers: Optional[Dict[Node, FrozenSet[Node]]] = None,
+    written: Optional[Dict[Node, FrozenSet[Node]]] = None,
 ) -> Tuple[Optional[str], int]:
-    rows = dependency_rows(graph, node_from_object(obj), writers)
+    rows = dependency_rows(graph, node_from_object(obj), writers, written)
     if not rows:
         return None, 0
     relpath = obj.deps_relpath
@@ -269,6 +306,7 @@ def _write_dep_objects(
     graph: DependencyGraph,
     workers: int,
     writers: Optional[Dict[Node, FrozenSet[Node]]] = None,
+    written_tables: Optional[Dict[Node, FrozenSet[Node]]] = None,
 ) -> Tuple[Set[str], int]:
     remaining = len(to_process)
     iterator = iter(to_process)
@@ -282,7 +320,14 @@ def _write_dep_objects(
             if obj is None:
                 break
             futures[
-                pool.submit(_write_object_deps, output_dir, obj, graph, writers)
+                pool.submit(
+                    _write_object_deps,
+                    output_dir,
+                    obj,
+                    graph,
+                    writers,
+                    written_tables,
+                )
             ] = obj
         while futures:
             done, _pending = wait(futures, return_when=FIRST_COMPLETED)
@@ -316,7 +361,14 @@ def _write_dep_objects(
                 nxt = next(iterator, None)
                 if nxt is not None:
                     futures[
-                        pool.submit(_write_object_deps, output_dir, nxt, graph, writers)
+                        pool.submit(
+                            _write_object_deps,
+                            output_dir,
+                            nxt,
+                            graph,
+                            writers,
+                            written_tables,
+                        )
                     ] = nxt
     finally:
         for future in list(futures):
@@ -347,9 +399,16 @@ def write_schema_dependencies(
     )
     known: Set[str] = set()
     written = 0
+    written_tables = invert_dml_writers(writers)
     if to_process:
         known, written = _write_dep_objects(
-            output_dir, schema, to_process, graph, workers, writers
+            output_dir,
+            schema,
+            to_process,
+            graph,
+            workers,
+            writers,
+            written_tables,
         )
 
     stale = walk_deps_files(output_dir, schema, object_types) - known

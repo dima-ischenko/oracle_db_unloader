@@ -137,15 +137,27 @@ def test_object_type_filter_keeps_other_types(fresh_schema, tmp_path):
 
 def test_dependencies_write_view_to_table_paths(fresh_schema, tmp_path):
     time.sleep(1.1)
-    _unload(fresh_schema, tmp_path, object_types=['TABLE', 'VIEW'], dependencies=True)
+    _unload(
+        fresh_schema,
+        tmp_path,
+        object_types=['TABLE', 'VIEW', 'PROCEDURE'],
+        dependencies=True,
+    )
 
     view_deps = Path(tmp_path) / 'test' / '_deps' / 'views' / 'emp_v.md'
     table_deps = Path(tmp_path) / 'test' / '_deps' / 'tables' / 'emp_heap.md'
+    load_deps = Path(tmp_path) / 'test' / '_deps' / 'procedures' / 'p_emp_heap_load.md'
+    read_deps = Path(tmp_path) / 'test' / '_deps' / 'procedures' / 'p_emp_heap_read.md'
     assert view_deps.is_file()
     assert table_deps.is_file()
+    assert load_deps.is_file()
+    assert read_deps.is_file()
     view_text = view_deps.read_text(encoding='utf-8')
     table_text = table_deps.read_text(encoding='utf-8')
+    load_text = load_deps.read_text(encoding='utf-8')
+    read_text = read_deps.read_text(encoding='utf-8')
     assert '## Downstream' in view_text
+    assert '## Downstream writes' not in view_text
     assert '> test.emp_heap(table)' in view_text
     assert 'emp_v(view)' not in view_text
     assert '## Upstream writes' in table_text
@@ -159,6 +171,14 @@ def test_dependencies_write_view_to_table_paths(fresh_schema, tmp_path):
     assert 'p_emp_heap_load' in writes
     assert 'p_emp_heap_load' not in rest
     assert 'emp_heap(table)' not in table_text
+    assert '## Downstream writes' in load_text
+    assert '> test.emp_heap(table)' in load_text
+    assert '## Downstream reads' not in load_text
+    assert '## Downstream\n' not in load_text
+    assert '## Downstream reads' in read_text
+    assert '> test.emp_heap(table)' in read_text
+    assert '## Downstream writes' not in read_text
+    assert '## Downstream\n' not in read_text
     assert not (
         Path(tmp_path) / 'test' / '_deps' / 'tables' / 'currency_dict.md'
     ).exists()

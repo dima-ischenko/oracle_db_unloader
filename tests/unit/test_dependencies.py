@@ -7,12 +7,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from oracle_db_unloader.dependencies import (
+    DML_UNIT_TYPES,
     Node,
     build_graph,
     dependency_rows,
     dump_dependencies,
-    format_dep_markdown,
     fetch_dml_writers,
+    format_dep_markdown,
+    invert_dml_writers,
     write_schema_dependencies,
 )
 from oracle_db_unloader.inventory import DbObject
@@ -40,6 +42,8 @@ def _rows_by_type(rows):
         'upstream_write': [row for row in rows if row.ref_type == 'upstream_write'],
         'upstream_read': [row for row in rows if row.ref_type == 'upstream_read'],
         'downstream': [row for row in rows if row.ref_type == 'downstream'],
+        'downstream_write': [row for row in rows if row.ref_type == 'downstream_write'],
+        'downstream_read': [row for row in rows if row.ref_type == 'downstream_read'],
     }
 
 
@@ -240,7 +244,61 @@ def test_dump_dependencies_writes_upstream_writes(monkeypatch, tmp_path):
         encoding='utf-8'
     )
     assert '## Upstream writes' not in view_text
+    assert '## Downstream writes' not in view_text
     assert '## Downstream' in view_text
+
+
+def test_dump_dependencies_writes_downstream_writes(monkeypatch, tmp_path):
+    def fake_edges(_engine):
+        return [
+            _edge(('SCOTT', 'P_LOAD', 'PROCEDURE'), ('SCOTT', 'EMP', 'TABLE')),
+            _edge(('SCOTT', 'P_LOAD', 'PROCEDURE'), ('SCOTT', 'DEPT', 'TABLE')),
+            _edge(('SCOTT', 'P_READ', 'PROCEDURE'), ('SCOTT', 'EMP', 'TABLE')),
+        ]
+
+    def fake_inventory(_engine, schema):
+        return [
+            _obj(schema, 'P_LOAD', 'PROCEDURE'),
+            _obj(schema, 'P_READ', 'PROCEDURE'),
+        ]
+
+    monkeypatch.setattr(
+        'oracle_db_unloader.dependencies.fetch_dependency_edges', fake_edges
+    )
+    monkeypatch.setattr(
+        'oracle_db_unloader.dependencies.fetch_dml_writers',
+        lambda _engine: {
+            Node('SCOTT', 'EMP', 'TABLE'): frozenset(
+                {Node('SCOTT', 'P_LOAD', 'PROCEDURE')}
+            )
+        },
+    )
+    monkeypatch.setattr(
+        'oracle_db_unloader.dependencies.fetch_inventory', fake_inventory
+    )
+
+    dumped = dump_dependencies(
+        MagicMock(), tmp_path, ['scott'], ['PROCEDURE'], max_workers=2
+    )
+    assert dumped == 2
+    load_text = (tmp_path / 'scott' / '_deps' / 'procedures' / 'p_load.md').read_text(
+        encoding='utf-8'
+    )
+    assert load_text == (
+        '## Downstream writes\n'
+        '\n'
+        '> scott.emp(table)\n'
+        '\n'
+        '## Downstream reads\n'
+        '\n'
+        '> scott.dept(table)\n'
+    )
+    read_text = (tmp_path / 'scott' / '_deps' / 'procedures' / 'p_read.md').read_text(
+        encoding='utf-8'
+    )
+    assert read_text == ('## Downstream reads\n\n> scott.emp(table)\n')
+    assert '## Downstream\n' not in load_text
+    assert '## Downstream\n' not in read_text
 
 
 def test_fetch_dml_writers_skips_when_probe_empty():
@@ -259,16 +317,16 @@ def test_fetch_dml_writers_maps_table_to_unit():
     conn.execute.side_effect = [
         probe,
         [
-            ('CORE', 'EMP', 'TECH', 'P_LOAD', 'PROCEDURE'),
-            ('CORE', 'EMP', 'TECH', 'PKG_ETL', 'PACKAGE BODY'),
+            ('SCOTT', 'EMP', 'SCOTT', 'P_LOAD', 'PROCEDURE'),
+            ('SCOTT', 'EMP', 'SCOTT', 'PKG_ETL', 'PACKAGE BODY'),
         ],
     ]
     writers = fetch_dml_writers(engine)
     assert writers == {
-        Node('CORE', 'EMP', 'TABLE'): frozenset(
+        Node('SCOTT', 'EMP', 'TABLE'): frozenset(
             {
-                Node('TECH', 'P_LOAD', 'PROCEDURE'),
-                Node('TECH', 'PKG_ETL', 'PACKAGE BODY'),
+                Node('SCOTT', 'P_LOAD', 'PROCEDURE'),
+                Node('SCOTT', 'PKG_ETL', 'PACKAGE BODY'),
             }
         )
     }
@@ -284,56 +342,56 @@ def test_format_dep_markdown_omits_empty_section():
 def test_table_writers_split_from_upstream():
     graph = build_graph(
         [
-            _edge(('TECH', 'P_LOAD', 'PROCEDURE'), ('CORE', 'EMP', 'TABLE')),
-            _edge(('TECH', 'P_READ', 'PROCEDURE'), ('CORE', 'EMP', 'TABLE')),
-            _edge(('HR', 'EMP_V', 'VIEW'), ('CORE', 'EMP', 'TABLE')),
+            _edge(('SCOTT', 'P_LOAD', 'PROCEDURE'), ('SCOTT', 'EMP', 'TABLE')),
+            _edge(('SCOTT', 'P_READ', 'PROCEDURE'), ('SCOTT', 'EMP', 'TABLE')),
+            _edge(('HR', 'EMP_V', 'VIEW'), ('SCOTT', 'EMP', 'TABLE')),
             _edge(('HR', 'P_REPORT', 'PROCEDURE'), ('HR', 'EMP_V', 'VIEW')),
         ]
     )
     writers = {
-        Node('CORE', 'EMP', 'TABLE'): frozenset({Node('TECH', 'P_LOAD', 'PROCEDURE')})
+        Node('SCOTT', 'EMP', 'TABLE'): frozenset({Node('SCOTT', 'P_LOAD', 'PROCEDURE')})
     }
-    rows = _rows_by_type(dependency_rows(graph, Node('CORE', 'EMP', 'TABLE'), writers))
+    rows = _rows_by_type(dependency_rows(graph, Node('SCOTT', 'EMP', 'TABLE'), writers))
     assert [row.xref_path for row in rows['upstream_write']] == [
-        'tech.p_load(procedure) >'
+        'scott.p_load(procedure) >'
     ]
     assert [row.xref_path for row in rows['upstream_read']] == [
         'hr.p_report(procedure) > hr.emp_v(view) >',
-        'tech.p_read(procedure) >',
+        'scott.p_read(procedure) >',
     ]
     assert rows['upstream'] == []
     assert format_dep_markdown(
-        dependency_rows(graph, Node('CORE', 'EMP', 'TABLE'), writers)
+        dependency_rows(graph, Node('SCOTT', 'EMP', 'TABLE'), writers)
     ) == (
         '## Upstream writes\n'
         '\n'
-        'tech.p_load(procedure) >\n'
+        'scott.p_load(procedure) >\n'
         '\n'
         '## Upstream reads\n'
         '\n'
         'hr.p_report(procedure) > hr.emp_v(view) >\n'
-        'tech.p_read(procedure) >\n'
+        'scott.p_read(procedure) >\n'
     )
 
 
 def test_package_body_dml_marks_whole_unit():
     graph = build_graph(
         [
-            _edge(('TECH', 'PKG_ETL', 'PACKAGE BODY'), ('CORE', 'EMP', 'TABLE')),
-            _edge(('TECH', 'P_READ', 'PROCEDURE'), ('CORE', 'EMP', 'TABLE')),
+            _edge(('SCOTT', 'PKG_ETL', 'PACKAGE BODY'), ('SCOTT', 'EMP', 'TABLE')),
+            _edge(('SCOTT', 'P_READ', 'PROCEDURE'), ('SCOTT', 'EMP', 'TABLE')),
         ]
     )
     writers = {
-        Node('CORE', 'EMP', 'TABLE'): frozenset(
-            {Node('TECH', 'PKG_ETL', 'PACKAGE BODY')}
+        Node('SCOTT', 'EMP', 'TABLE'): frozenset(
+            {Node('SCOTT', 'PKG_ETL', 'PACKAGE BODY')}
         )
     }
-    rows = _rows_by_type(dependency_rows(graph, Node('CORE', 'EMP', 'TABLE'), writers))
+    rows = _rows_by_type(dependency_rows(graph, Node('SCOTT', 'EMP', 'TABLE'), writers))
     assert [row.xref_path for row in rows['upstream_write']] == [
-        'tech.pkg_etl(package body) >'
+        'scott.pkg_etl(package body) >'
     ]
     assert [row.xref_path for row in rows['upstream_read']] == [
-        'tech.p_read(procedure) >'
+        'scott.p_read(procedure) >'
     ]
     assert rows['upstream'] == []
 
@@ -341,14 +399,14 @@ def test_package_body_dml_marks_whole_unit():
 def test_writers_none_or_missing_keeps_single_upstream():
     graph = build_graph(
         [
-            _edge(('TECH', 'P_LOAD', 'PROCEDURE'), ('CORE', 'EMP', 'TABLE')),
-            _edge(('HR', 'EMP_V', 'VIEW'), ('CORE', 'EMP', 'TABLE')),
+            _edge(('SCOTT', 'P_LOAD', 'PROCEDURE'), ('SCOTT', 'EMP', 'TABLE')),
+            _edge(('HR', 'EMP_V', 'VIEW'), ('SCOTT', 'EMP', 'TABLE')),
         ]
     )
-    table = Node('CORE', 'EMP', 'TABLE')
+    table = Node('SCOTT', 'EMP', 'TABLE')
     expected = [
         'hr.emp_v(view) >',
-        'tech.p_load(procedure) >',
+        'scott.p_load(procedure) >',
     ]
     none_rows = _rows_by_type(dependency_rows(graph, table, None))
     assert [row.xref_path for row in none_rows['upstream']] == expected
@@ -372,10 +430,136 @@ def test_writers_none_or_missing_keeps_single_upstream():
         graph,
         Node('HR', 'EMP_V', 'VIEW'),
         {
-            table: frozenset({Node('TECH', 'P_LOAD', 'PROCEDURE')}),
+            table: frozenset({Node('SCOTT', 'P_LOAD', 'PROCEDURE')}),
         },
     )
     assert '## Upstream writes' not in format_dep_markdown(view_rows)
+    assert '## Downstream writes' not in format_dep_markdown(view_rows)
+    assert '## Downstream reads' not in format_dep_markdown(view_rows)
+    assert '## Downstream\n' in format_dep_markdown(view_rows)
+
+
+def test_invert_dml_writers_maps_unit_to_tables():
+    writers = {
+        Node('SCOTT', 'EMP', 'TABLE'): frozenset(
+            {
+                Node('SCOTT', 'P_LOAD', 'PROCEDURE'),
+                Node('SCOTT', 'PKG_ETL', 'PACKAGE BODY'),
+            }
+        ),
+        Node('SCOTT', 'DEPT', 'TABLE'): frozenset({Node('SCOTT', 'P_LOAD', 'PROCEDURE')}),
+    }
+    assert invert_dml_writers(None) is None
+    assert invert_dml_writers(writers) == {
+        Node('SCOTT', 'P_LOAD', 'PROCEDURE'): frozenset(
+            {Node('SCOTT', 'EMP', 'TABLE'), Node('SCOTT', 'DEPT', 'TABLE')}
+        ),
+        Node('SCOTT', 'PKG_ETL', 'PACKAGE BODY'): frozenset(
+            {Node('SCOTT', 'EMP', 'TABLE')}
+        ),
+    }
+
+
+def test_dml_unit_writers_split_from_downstream():
+    graph = build_graph(
+        [
+            _edge(('SCOTT', 'P_LOAD', 'PROCEDURE'), ('SCOTT', 'EMP', 'TABLE')),
+            _edge(('SCOTT', 'P_LOAD', 'PROCEDURE'), ('SCOTT', 'DEPT', 'TABLE')),
+            _edge(('SCOTT', 'P_LOAD', 'PROCEDURE'), ('HR', 'EMP_V', 'VIEW')),
+            _edge(('HR', 'EMP_V', 'VIEW'), ('SCOTT', 'EMP', 'TABLE')),
+            _edge(('SCOTT', 'P_READ', 'PROCEDURE'), ('SCOTT', 'EMP', 'TABLE')),
+            _edge(('HR', 'P_REPORT', 'PROCEDURE'), ('HR', 'EMP_V', 'VIEW')),
+        ]
+    )
+    writers = {
+        Node('SCOTT', 'EMP', 'TABLE'): frozenset({Node('SCOTT', 'P_LOAD', 'PROCEDURE')})
+    }
+    load_rows = _rows_by_type(
+        dependency_rows(graph, Node('SCOTT', 'P_LOAD', 'PROCEDURE'), writers)
+    )
+    assert [row.xref_path for row in load_rows['downstream_write']] == [
+        '> scott.emp(table)'
+    ]
+    assert [row.xref_path for row in load_rows['downstream_read']] == [
+        '> hr.emp_v(view) > scott.emp(table)',
+        '> scott.dept(table)',
+    ]
+    assert load_rows['downstream'] == []
+    assert format_dep_markdown(
+        dependency_rows(graph, Node('SCOTT', 'P_LOAD', 'PROCEDURE'), writers)
+    ) == (
+        '## Downstream writes\n'
+        '\n'
+        '> scott.emp(table)\n'
+        '\n'
+        '## Downstream reads\n'
+        '\n'
+        '> hr.emp_v(view) > scott.emp(table)\n'
+        '> scott.dept(table)\n'
+    )
+
+    read_rows = _rows_by_type(
+        dependency_rows(graph, Node('SCOTT', 'P_READ', 'PROCEDURE'), writers)
+    )
+    assert read_rows['downstream_write'] == []
+    assert [row.xref_path for row in read_rows['downstream_read']] == [
+        '> scott.emp(table)'
+    ]
+    assert read_rows['downstream'] == []
+
+
+def test_downstream_split_only_for_dml_units():
+    for object_type in sorted(DML_UNIT_TYPES):
+        unit = Node('SCOTT', 'P_LOAD', object_type)
+        graph = build_graph(
+            [_edge(('SCOTT', 'P_LOAD', object_type), ('SCOTT', 'EMP', 'TABLE'))]
+        )
+        writers = {Node('SCOTT', 'EMP', 'TABLE'): frozenset({unit})}
+        text = format_dep_markdown(dependency_rows(graph, unit, writers))
+        assert '## Downstream writes\n' in text
+        assert '## Downstream\n' not in text
+
+    writers = {
+        Node('SCOTT', 'EMP', 'TABLE'): frozenset({Node('SCOTT', 'P_LOAD', 'PROCEDURE')})
+    }
+    for object_type in ('PACKAGE', 'VIEW', 'TABLE'):
+        graph = build_graph(
+            [_edge(('SCOTT', 'P_LOAD', object_type), ('SCOTT', 'EMP', 'TABLE'))]
+        )
+        text = format_dep_markdown(
+            dependency_rows(graph, Node('SCOTT', 'P_LOAD', object_type), writers)
+        )
+        assert '## Downstream writes' not in text
+        assert '## Downstream reads' not in text
+        assert '## Downstream\n' in text
+
+
+def test_writers_none_or_missing_keeps_single_downstream():
+    graph = build_graph(
+        [
+            _edge(('SCOTT', 'P_LOAD', 'PROCEDURE'), ('SCOTT', 'EMP', 'TABLE')),
+            _edge(('SCOTT', 'P_LOAD', 'PROCEDURE'), ('SCOTT', 'DEPT', 'TABLE')),
+        ]
+    )
+    proc = Node('SCOTT', 'P_LOAD', 'PROCEDURE')
+    expected = ['> scott.dept(table)', '> scott.emp(table)']
+    none_rows = _rows_by_type(dependency_rows(graph, proc, None))
+    assert [row.xref_path for row in none_rows['downstream']] == expected
+    assert none_rows['downstream_write'] == []
+    assert none_rows['downstream_read'] == []
+    none_text = format_dep_markdown(dependency_rows(graph, proc, None))
+    assert '## Downstream writes' not in none_text
+    assert '## Downstream reads' not in none_text
+    assert '## Downstream\n' in none_text
+
+    empty_rows = _rows_by_type(dependency_rows(graph, proc, {}))
+    assert empty_rows['downstream'] == []
+    assert empty_rows['downstream_write'] == []
+    assert [row.xref_path for row in empty_rows['downstream_read']] == expected
+    empty_text = format_dep_markdown(dependency_rows(graph, proc, {}))
+    assert '## Downstream writes' not in empty_text
+    assert '## Downstream\n' not in empty_text
+    assert '## Downstream reads\n' in empty_text
 
 
 def test_write_schema_dependencies_logs_workers(tmp_path, caplog):
@@ -413,7 +597,7 @@ def test_write_schema_dependencies_failure_stops_remaining(monkeypatch, tmp_path
     )
     written = []
 
-    def fake_write(output_dir, obj, _graph, _writers=None):
+    def fake_write(output_dir, obj, _graph, _writers=None, _written=None):
         written.append(obj.name)
         if obj.name == 'T1':
             raise RuntimeError('boom')
